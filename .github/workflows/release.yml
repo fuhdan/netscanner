@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "plugins/[!_]*.py"
+      - "plugins/*.md"
+      - "tests/test_plugin_*.py"
+    tags:
+      - "v[0-9]*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run tests
+        run: |
+          pip install pytest -q
+          pytest tests/ -v
+
+      - name: Determine version tag
+        id: version
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "auto=false" >> $GITHUB_OUTPUT
+          else
+            LATEST=$(git tag --sort=-version:refname \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+            [ -z "$LATEST" ] && LATEST="v0.0.0"
+            IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST#v}"
+            NEW_TAG="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+            echo "tag=$NEW_TAG" >> $GITHUB_OUTPUT
+            echo "auto=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create and push tag (auto releases only)
+        if: steps.version.outputs.auto == 'true'
+        run: |
+          git config user.name "netscanner-release"
+          git config user.email "github-actions@github.com"
+          git tag ${{ steps.version.outputs.tag }}
+          git push origin ${{ steps.version.outputs.tag }}
+
+      - name: Build release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          PREV_TAG=$(git tag --sort=-version:refname \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed -n '2p')
+
+          if [ -z "$PREV_TAG" ]; then
+            NEW_MDS=$(ls plugins/*.md 2>/dev/null || true)
+          else
+            NEW_MDS=$(git diff --name-only --diff-filter=A \
+              "${PREV_TAG}..HEAD" -- 'plugins/*.md' 2>/dev/null || true)
+          fi
+
+          PLUGIN_NOTES=""
+          for MD in $NEW_MDS; do
+            [ -f "$MD" ] || continue
+            PLUGIN_NAME=$(basename "$MD" .md)
+            PROTOCOL=$(python3 .github/scripts/extract_protocol.py "$MD")
+            if [ -n "$PROTOCOL" ]; then
+              PLUGIN_NOTES="${PLUGIN_NOTES}### \`${PLUGIN_NAME}\` plugin added\n\n${PROTOCOL}\n\n"
+            fi
+          done
+
+          AUTO=$(gh api repos/fuhdan/netscanner/releases/generate-notes \
+            --method POST \
+            --field tag_name="$TAG" \
+            --field target_commitish=main \
+            --jq '.body' 2>/dev/null || echo "")
+
+          if [ -n "$PLUGIN_NOTES" ]; then
+            printf "## New plugins\n\n%b---\n\n%s" "$PLUGIN_NOTES" "$AUTO" \
+              > /tmp/release_notes.md
+          else
+            printf "%s" "$AUTO" > /tmp/release_notes.md
+          fi
+
+      - name: Package assets
+        run: |
+          zip -r netscanner-${{ steps.version.outputs.tag }}.zip \
+            netscanner.py plugins/ docs/ README.md
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create ${{ steps.version.outputs.tag }} \
+            netscanner-${{ steps.version.outputs.tag }}.zip \
+            --notes-file /tmp/release_notes.md \
+            --title "${{ steps.version.outputs.tag }}"

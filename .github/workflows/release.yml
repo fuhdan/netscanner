@@ -24,6 +24,11 @@ jobs:
       - name: Check for meaningful plugin changes
         id: guard
         run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "Tag push — running release unconditionally."
+            exit 0
+          fi
           CHANGED=$(git diff --name-only HEAD~1 -- plugins/ tests/ 2>/dev/null \
             | grep -vE '(^|/)__init__\.py$' || true)
           if [ -z "$CHANGED" ]; then

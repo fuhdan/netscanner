@@ -4,8 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "plugins/[!_]*.py"
-      - "plugins/*.md"
+      - "plugins/**"
       - "tests/test_plugin_*.py"
     tags:
       - "v[0-9]*"
@@ -22,17 +21,32 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Check for meaningful plugin changes
+        id: guard
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 -- plugins/ tests/ 2>/dev/null \
+            | grep -vE '(^|/)__init__\.py$' || true)
+          if [ -z "$CHANGED" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "Only __init__.py changed — skipping release."
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
       - uses: actions/setup-python@v5
+        if: steps.guard.outputs.skip != 'true'
         with:
           python-version: "3.12"
 
       - name: Run tests
+        if: steps.guard.outputs.skip != 'true'
         run: |
           pip install pytest -q
           pytest tests/ -v
 
       - name: Determine version tag
         id: version
+        if: steps.guard.outputs.skip != 'true'
         run: |
           if [ "${{ github.ref_type }}" = "tag" ]; then
             echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
@@ -48,7 +62,7 @@ jobs:
           fi
 
       - name: Create and push tag (auto releases only)
-        if: steps.version.outputs.auto == 'true'
+        if: steps.guard.outputs.skip != 'true' && steps.version.outputs.auto == 'true'
         run: |
           git config user.name "netscanner-release"
           git config user.email "github-actions@github.com"
@@ -56,6 +70,7 @@ jobs:
           git push origin ${{ steps.version.outputs.tag }}
 
       - name: Build release notes
+        if: steps.guard.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -94,11 +109,13 @@ jobs:
           fi
 
       - name: Package assets
+        if: steps.guard.outputs.skip != 'true'
         run: |
           zip -r netscanner-${{ steps.version.outputs.tag }}.zip \
             netscanner.py plugins/ docs/ README.md
 
       - name: Create GitHub release
+        if: steps.guard.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

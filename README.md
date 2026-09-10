@@ -6,8 +6,9 @@ You point it at a subnet. It connects to every host, pretends to be a legitimate
 protocol client, takes notes, and leaves. The pcap file it generates is, frankly,
 more organized than most people's inboxes.
 
-**Supported protocols:** Modbus (the one your PLC uses). More as the community
-gets around to it — see [Community Plugins](#community-plugins).
+**Supported protocols:** Modbus (the one your PLC uses) and OPC-UA (the one
+that replaced it). More as the community gets around to it — see
+[Community Plugins](#community-plugins).
 
 ---
 
@@ -35,6 +36,7 @@ python3 netscanner.py 10.0.0.0/24 --protocol modbus \
 | Plugin | Port | Notes |
 |--------|------|-------|
 | `modbus` | 502 | FC3 (holding registers) with FC1 (coil read) fallback; tests unit IDs 0 and 1 |
+| `opcua` | 4840 | UACP Hello/Acknowledge handshake; reports negotiated buffer limits |
 
 ---
 
@@ -74,6 +76,8 @@ synthesized in userspace — no root required, no raw socket privileges needed.
 | `ZERO_WINDOW` | Connected, then froze the TCP receive window |
 | `CLOSED_IMMEDIATELY` | Said hi and hung up before we asked anything |
 | `NO_MODBUS` | Something answered, but it wasn't speaking Modbus |
+| `UA_ERROR` | An OPC-UA server answered with an Error frame — still a find |
+| `NO_OPCUA` | Something answered, but it wasn't speaking OPC-UA |
 
 ---
 
@@ -112,7 +116,6 @@ and are automatically synced here. To contribute a plugin, open a PR there — n
 
 | Protocol | Port |
 |----------|------|
-| OPC-UA | 4840 |
 | BACnet/IP | 47808 |
 | DNP3 | 20000 |
 | EtherNet/IP | 44818 |
@@ -160,7 +163,7 @@ handle ZeroWindow and timeouts, and a complete real-world example in `plugins/mo
 
 ```bash
 python3 -m pytest tests/
-# 78 tests. They all pass. We checked.
+# 121 tests. They all pass. We checked.
 ```
 
 ---

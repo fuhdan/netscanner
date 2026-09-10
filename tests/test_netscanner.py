@@ -10,12 +10,12 @@ from unittest.mock import MagicMock, patch
 
 from netscanner import (
     ScanResult, ScanConfig, ProtocolPlugin,
-    PcapWriter, TCP_ACK, TCP_PSH_ACK, _ip_checksum,
+    PcapWriter, TCP_ACK, TCP_PSH_ACK, TCP_RST, TCP_FIN_ACK, _ip_checksum,
     expand_targets,
     STATUS_OPEN, STATUS_REFUSED, STATUS_TIMEOUT_CONNECT,
     STATUS_CLOSED_IMMEDIATELY, STATUS_NO_PROTOCOL,
     scan_host, run_scan, format_result_line, format_summary, write_csv,
-    _discover_plugins,
+    _discover_plugins, ProbeChannel, ZeroWindowError,
 )
 
 
@@ -625,3 +625,150 @@ def test_pcap_writers_are_not_all_open_at_once():
     finally:
         import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# ProbeChannel — the send/receive pair and the capture frames every plugin
+# used to re-implement
+# ---------------------------------------------------------------------------
+
+class _CollectingWriter:
+    """Stands in for a PcapWriter and keeps what it was asked to write."""
+
+    def __init__(self):
+        self.frames = []
+
+    def write_packet(self, ts, src_ip, dst_ip, src_port, dst_port, flags,
+                     seq, ack, payload=b""):
+        self.frames.append({
+            "src_ip": src_ip, "dst_ip": dst_ip, "src_port": src_port,
+            "dst_port": dst_port, "flags": flags, "seq": seq, "ack": ack,
+            "payload": payload,
+        })
+
+
+def _channel(writers=None, response_timeout=3.0):
+    sock = MagicMock()
+    sock.getsockname.return_value = ("10.0.0.250", 51000)
+    cfg = ScanConfig(port=502, response_timeout=response_timeout)
+    return sock, ProbeChannel(sock, "10.0.0.1", cfg, writers)
+
+
+@patch("netscanner.select.select")
+def test_channel_send_raises_zero_window_when_not_writable(mock_select):
+    mock_select.return_value = ([], [], [])
+    sock, ch = _channel()
+    with pytest.raises(ZeroWindowError):
+        ch.send(b"hello")
+    sock.sendall.assert_not_called()
+
+
+@patch("netscanner.select.select")
+def test_channel_send_writes_a_frame_and_advances_the_scanner_seq(mock_select):
+    w = _CollectingWriter()
+    sock, ch = _channel([w])
+    mock_select.return_value = ([], [sock], [])
+    ch.send(b"abcd")
+    ch.send(b"ef")
+    assert [f["seq"] for f in w.frames] == [1, 5]
+    assert all(f["ack"] == 1 for f in w.frames)
+    assert w.frames[0]["src_ip"] == "10.0.0.250"
+    assert w.frames[0]["dst_ip"] == "10.0.0.1"
+    assert w.frames[0]["flags"] == TCP_PSH_ACK
+    assert w.frames[0]["payload"] == b"abcd"
+
+
+@patch("netscanner.select.select")
+def test_channel_recv_raises_timeout_when_nothing_arrives(mock_select):
+    mock_select.return_value = ([], [], [])
+    sock, ch = _channel()
+    with pytest.raises(TimeoutError):
+        ch.recv()
+
+
+@patch("netscanner.select.select")
+def test_channel_recv_raises_oserror_when_the_peer_closes(mock_select):
+    sock, ch = _channel()
+    mock_select.return_value = ([sock], [], [])
+    sock.recv.return_value = b""
+    with pytest.raises(OSError):
+        ch.recv()
+
+
+@patch("netscanner.select.select")
+def test_channel_recv_writes_the_reverse_frame_and_advances_the_device_seq(
+        mock_select):
+    w = _CollectingWriter()
+    sock, ch = _channel([w])
+    mock_select.return_value = ([sock], [], [])
+    sock.recv.return_value = b"xyz"
+    assert ch.recv() == b"xyz"
+    f = w.frames[0]
+    assert f["src_ip"] == "10.0.0.1" and f["dst_ip"] == "10.0.0.250"
+    assert f["src_port"] == 502 and f["dst_port"] == 51000
+    assert (f["seq"], f["ack"]) == (1, 1)
+    sock.recv.return_value = b"z"
+    ch.recv()
+    assert w.frames[1]["seq"] == 4
+
+
+@patch("netscanner.select.select")
+def test_channel_exchange_sends_then_receives(mock_select):
+    w = _CollectingWriter()
+    sock, ch = _channel([w])
+    mock_select.side_effect = lambda r, wr, x, t: (([sock], [], [])
+                                                   if r else ([], [sock], []))
+    sock.recv.return_value = b"pong"
+    assert ch.exchange(b"ping") == b"pong"
+    assert [f["payload"] for f in w.frames] == [b"ping", b"pong"]
+    # the reply is acknowledged against the bytes we sent
+    assert w.frames[1]["ack"] == 1 + len(b"ping")
+
+
+@patch("netscanner.select.select")
+def test_channel_notes_reset_from_either_side(mock_select):
+    w = _CollectingWriter()
+    sock, ch = _channel([w])
+    mock_select.return_value = ([], [sock], [])
+    ch.send(b"ab")
+    ch.note_reset()
+    ch.note_reset(from_scanner=False)
+    assert w.frames[1]["flags"] == TCP_RST
+    assert w.frames[1]["src_ip"] == "10.0.0.250"
+    assert w.frames[2]["flags"] == TCP_RST
+    assert w.frames[2]["src_ip"] == "10.0.0.1"
+
+
+@patch("netscanner.select.select")
+def test_channel_notes_a_clean_finish(mock_select):
+    w = _CollectingWriter()
+    sock, ch = _channel([w])
+    mock_select.return_value = ([], [sock], [])
+    ch.send(b"ab")
+    ch.note_finished()
+    assert w.frames[-1]["flags"] == TCP_FIN_ACK
+    assert w.frames[-1]["seq"] == 3
+
+
+@patch("netscanner.select.select")
+def test_channel_without_writers_records_nothing_and_reads_no_socket_name(
+        mock_select):
+    sock = MagicMock()
+    cfg = ScanConfig(port=502)
+    ch = ProbeChannel(sock, "10.0.0.1", cfg, None)
+    mock_select.side_effect = lambda r, wr, x, t: (([sock], [], [])
+                                                   if r else ([], [sock], []))
+    sock.recv.return_value = b"ok"
+    assert ch.exchange(b"go") == b"ok"
+    ch.note_reset()
+    ch.note_finished()
+    sock.getsockname.assert_not_called()
+
+
+@patch("netscanner.select.select")
+def test_channel_writes_to_every_writer(mock_select):
+    a, b = _CollectingWriter(), _CollectingWriter()
+    sock, ch = _channel([a, b])
+    mock_select.return_value = ([], [sock], [])
+    ch.send(b"x")
+    assert len(a.frames) == 1 and len(b.frames) == 1

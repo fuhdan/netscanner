@@ -208,6 +208,93 @@ class PcapWriter:
                 pass
 
 
+class ZeroWindowError(Exception):
+    """The peer is connected but its receive window is closed, so it cannot take
+    the request. Distinct from silence: the connection is alive, the peer is
+    not reading."""
+
+
+class ProbeChannel:
+    """The socket work every plugin would otherwise write for itself.
+
+    Sends and receives under the scan's configured timeout, tells a stalled
+    receive window apart from a silent peer, and records each event as a capture
+    frame with both sequence numbers kept straight. Construct one at the top of
+    ``probe()`` and use it instead of touching the socket directly; a plugin that
+    needs something this does not offer can still use the socket.
+    """
+
+    def __init__(self, sock: socket.socket, ip: str, cfg: "ScanConfig",
+                 pcap_writers: Optional[List["PcapWriter"]] = None) -> None:
+        self._sock = sock
+        self._ip = ip
+        self._cfg = cfg
+        self._writers = list(pcap_writers) if pcap_writers else []
+        self._local_ip = "0.0.0.0"  # nosec B104 — pcap source IP, not a bind
+        self._src_port = 0
+        if self._writers:
+            self._local_ip, self._src_port = sock.getsockname()
+        # The framework wrote SYN/SYN-ACK/ACK before probe() was called, so both
+        # sides start at 1.
+        self._scanner_seq = 1
+        self._device_seq = 1
+
+    def send(self, payload: bytes) -> None:
+        """Send, or raise ZeroWindowError if the peer will not take it."""
+        _, writable, _ = select.select([], [self._sock], [],
+                                       self._cfg.response_timeout)
+        if not writable:
+            raise ZeroWindowError("receive window closed")
+        ts = time.time()
+        self._sock.sendall(payload)
+        self._frame(ts, True, TCP_PSH_ACK, payload)
+        self._scanner_seq += len(payload)
+
+    def recv(self, bufsize: int = 4096) -> bytes:
+        """Read one response, or raise TimeoutError if the peer stays silent
+        and OSError if it closed."""
+        readable, _, _ = select.select([self._sock], [], [],
+                                       self._cfg.response_timeout)
+        if not readable:
+            raise TimeoutError("response timeout")
+        data = self._sock.recv(bufsize)
+        ts = time.time()
+        if not data:
+            raise OSError("connection closed during recv")
+        self._frame(ts, False, TCP_PSH_ACK, data)
+        self._device_seq += len(data)
+        return data
+
+    def exchange(self, payload: bytes, bufsize: int = 4096) -> bytes:
+        """One request, one response."""
+        self.send(payload)
+        return self.recv(bufsize)
+
+    def note_reset(self, from_scanner: bool = True) -> None:
+        """Record that the exchange ended in a reset."""
+        self._frame(time.time(), from_scanner, TCP_RST)
+
+    def note_finished(self) -> None:
+        """Record that the exchange completed and we are closing cleanly."""
+        self._frame(time.time(), True, TCP_FIN_ACK)
+
+    def _frame(self, ts: float, from_scanner: bool, flags: int,
+               payload: bytes = b"") -> None:
+        if not self._writers:
+            return
+        if from_scanner:
+            src_ip, dst_ip = self._local_ip, self._ip
+            src_port, dst_port = self._src_port, self._cfg.port
+            seq, ack = self._scanner_seq, self._device_seq
+        else:
+            src_ip, dst_ip = self._ip, self._local_ip
+            src_port, dst_port = self._cfg.port, self._src_port
+            seq, ack = self._device_seq, self._scanner_seq
+        for writer in self._writers:
+            writer.write_packet(ts, src_ip, dst_ip, src_port, dst_port,
+                                flags, seq, ack, payload)
+
+
 def _rst_close(sock: socket.socket) -> None:
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,

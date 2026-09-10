@@ -118,8 +118,12 @@ jobs:
         if: steps.guard.outputs.skip != 'true'
         run: |
           ZIP=netscanner-${{ steps.version.outputs.tag }}.zip
+          # The test step above imports the plugins and leaves a __pycache__
+          # behind; without this the archive ships bytecode built for the
+          # runner's interpreter.
           zip -r "$ZIP" \
-            netscanner.py plugins/ docs/ README.md LICENSE NOTICE
+            netscanner.py plugins/ docs/ README.md LICENSE NOTICE \
+            -x '*__pycache__*'
           sha256sum "$ZIP" > "$ZIP.sha256"
 
       - name: Create GitHub release

@@ -26,6 +26,17 @@ output formatting, CLI. Protocol-agnostic. Changes here affect every plugin.
 3. Run the full suite: `python3 -m pytest tests/ -v`
 4. Open a PR against `main`. CI must be green before review.
 
+### Framework changes that plugins depend on
+
+netscanner-plugins validates every plugin against **this repository's `main`**:
+its CI clones netscanner, copies the plugin in, and runs the whole suite. A
+framework change that plugins will use therefore has to be merged here before a
+plugin pull request using it can pass CI there.
+
+Merge the framework change first, then re-run the checks on the plugin side —
+GitHub does not notice that another repository moved, so those checks stay red
+until someone asks for them again.
+
 ### What belongs in the framework vs. a plugin
 
 **Framework** (`netscanner.py`): anything that applies to all protocols.

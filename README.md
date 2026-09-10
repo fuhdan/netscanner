@@ -75,9 +75,15 @@ synthesized in userspace — no root required, no raw socket privileges needed.
 | `TIMEOUT_RESPONSE` | Connected fine, then went silent |
 | `ZERO_WINDOW` | Connected, then froze the TCP receive window |
 | `CLOSED_IMMEDIATELY` | Said hi and hung up before we asked anything |
+| `NO_PROTOCOL` | Something spoke before we asked, or the plugin threw |
 | `NO_MODBUS` | Something answered, but it wasn't speaking Modbus |
+| `EXCEPTION` | A Modbus device returned an exception on both FC3 and FC1 |
 | `UA_ERROR` | An OPC-UA server answered with an Error frame — still a find |
 | `NO_OPCUA` | Something answered, but it wasn't speaking OPC-UA |
+
+The first seven come from the framework and mean the same thing whichever
+protocol you scanned. The rest are defined by a plugin for outcomes only its
+protocol has, so the full list depends on which plugins you have installed.
 
 ---
 
@@ -114,12 +120,21 @@ and are automatically synced here. To contribute a plugin, open a PR there — n
 
 ### Wanted protocols
 
-| Protocol | Port |
-|----------|------|
-| BACnet/IP | 47808 |
-| DNP3 | 20000 |
-| EtherNet/IP | 44818 |
-| S7comm | 102 |
+Nothing in netscanner is specific to industrial equipment. The two plugins that
+ship with it are reference implementations of the plugin contract, and they are
+OT protocols only because those were the ones needed first. Anything that
+answers over TCP is fair game.
+
+| Protocol | Port | |
+|----------|------|---|
+| BACnet/IP | 47808 | industrial |
+| DNP3 | 20000 | industrial |
+| EtherNet/IP | 44818 | industrial |
+| S7comm | 102 | industrial |
+| Redis | 6379 | infrastructure |
+| MQTT | 1883 | messaging |
+| SMTP | 25 | mail |
+| HTTP banner | 80 | web |
 
 If you want one, open an issue on netscanner-plugins.
 
@@ -155,6 +170,7 @@ handle ZeroWindow and timeouts, and a complete real-world example in `plugins/mo
 
 - Python 3.9+ — stdlib only, zero external dependencies
 - No root access required (pcap is synthesized in userspace via regular TCP sockets)
+- IPv4 only — IPv6 targets are reported and skipped rather than silently failing
 - Works on Linux, macOS, probably Windows (untested, patches welcome)
 
 ---
@@ -163,8 +179,15 @@ handle ZeroWindow and timeouts, and a complete real-world example in `plugins/mo
 
 ```bash
 python3 -m pytest tests/
-# 121 tests. They all pass. We checked.
+# 123 tests. They all pass. We checked.
 ```
+
+---
+
+## Licence
+
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Plugins are accepted
+under the same licence, which is what lets them ship inside these releases.
 
 ---
 

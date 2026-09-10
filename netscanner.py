@@ -74,12 +74,35 @@ def _discover_plugins() -> dict:
         if os.path.basename(path) == "__init__.py":
             continue
         stem = os.path.splitext(os.path.basename(path))[0]
-        mod = importlib.import_module(f"plugins.{stem}")
+        # Anyone may drop a file in here, so one bad plugin must cost that
+        # plugin and nothing else -- not the whole scanner, and not
+        # --list-protocols.
+        try:
+            mod = importlib.import_module(f"plugins.{stem}")
+        except Exception as exc:
+            print(f"[warn] plugin '{stem}' failed to import, skipping: "
+                  f"{exc.__class__.__name__}: {exc}", file=sys.stderr)
+            continue
         for obj in vars(mod).values():
             if (isinstance(obj, type) and
                     any(issubclass(obj, base) for base in _base_classes) and
                     obj not in _base_classes):
-                instance = obj()
+                try:
+                    instance = obj()
+                except Exception as exc:
+                    print(f"[warn] plugin class {obj.__name__} in '{stem}' "
+                          f"could not be created, skipping: "
+                          f"{exc.__class__.__name__}: {exc}", file=sys.stderr)
+                    continue
+                if not instance.name:
+                    print(f"[warn] plugin class {obj.__name__} in '{stem}' "
+                          f"declares no name, skipping", file=sys.stderr)
+                    continue
+                if instance.name in result:
+                    print(f"[warn] duplicate plugin name '{instance.name}' in "
+                          f"'{stem}', keeping the one already loaded",
+                          file=sys.stderr)
+                    continue
                 result[instance.name] = instance
     return result
 
@@ -100,19 +123,27 @@ def expand_targets(args: List[str], file_path: Optional[str]) -> List[str]:
     for entry in raw:
         try:
             net = ipaddress.ip_network(entry, strict=False)
-            if net.num_addresses == 1:
-                ip = str(net.network_address)
+        except ValueError:
+            print(f"[warn] invalid target '{entry}', skipping", file=sys.stderr)
+            continue
+        # The socket and the packet builder are both IPv4-only, so an IPv6
+        # target would be scanned and reported as a connect error. Say so here
+        # instead.
+        if net.version != 4:
+            print(f"[warn] IPv6 target '{entry}' skipped — netscanner is "
+                  f"IPv4-only", file=sys.stderr)
+            continue
+        if net.num_addresses == 1:
+            ip = str(net.network_address)
+            if ip not in seen:
+                seen.add(ip)
+                result.append(ip)
+        else:
+            for host in net.hosts():
+                ip = str(host)
                 if ip not in seen:
                     seen.add(ip)
                     result.append(ip)
-            else:
-                for host in net.hosts():
-                    ip = str(host)
-                    if ip not in seen:
-                        seen.add(ip)
-                        result.append(ip)
-        except ValueError:
-            print(f"[warn] invalid target '{entry}', skipping", file=sys.stderr)
     return result
 
 
@@ -175,6 +206,93 @@ class PcapWriter:
                 self._fh.close()
             except OSError:
                 pass
+
+
+class ZeroWindowError(Exception):
+    """The peer is connected but its receive window is closed, so it cannot take
+    the request. Distinct from silence: the connection is alive, the peer is
+    not reading."""
+
+
+class ProbeChannel:
+    """The socket work every plugin would otherwise write for itself.
+
+    Sends and receives under the scan's configured timeout, tells a stalled
+    receive window apart from a silent peer, and records each event as a capture
+    frame with both sequence numbers kept straight. Construct one at the top of
+    ``probe()`` and use it instead of touching the socket directly; a plugin that
+    needs something this does not offer can still use the socket.
+    """
+
+    def __init__(self, sock: socket.socket, ip: str, cfg: "ScanConfig",
+                 pcap_writers: Optional[List["PcapWriter"]] = None) -> None:
+        self._sock = sock
+        self._ip = ip
+        self._cfg = cfg
+        self._writers = list(pcap_writers) if pcap_writers else []
+        self._local_ip = "0.0.0.0"  # nosec B104 — pcap source IP, not a bind
+        self._src_port = 0
+        if self._writers:
+            self._local_ip, self._src_port = sock.getsockname()
+        # The framework wrote SYN/SYN-ACK/ACK before probe() was called, so both
+        # sides start at 1.
+        self._scanner_seq = 1
+        self._device_seq = 1
+
+    def send(self, payload: bytes) -> None:
+        """Send, or raise ZeroWindowError if the peer will not take it."""
+        _, writable, _ = select.select([], [self._sock], [],
+                                       self._cfg.response_timeout)
+        if not writable:
+            raise ZeroWindowError("receive window closed")
+        ts = time.time()
+        self._sock.sendall(payload)
+        self._frame(ts, True, TCP_PSH_ACK, payload)
+        self._scanner_seq += len(payload)
+
+    def recv(self, bufsize: int = 4096) -> bytes:
+        """Read one response, or raise TimeoutError if the peer stays silent
+        and OSError if it closed."""
+        readable, _, _ = select.select([self._sock], [], [],
+                                       self._cfg.response_timeout)
+        if not readable:
+            raise TimeoutError("response timeout")
+        data = self._sock.recv(bufsize)
+        ts = time.time()
+        if not data:
+            raise OSError("connection closed during recv")
+        self._frame(ts, False, TCP_PSH_ACK, data)
+        self._device_seq += len(data)
+        return data
+
+    def exchange(self, payload: bytes, bufsize: int = 4096) -> bytes:
+        """One request, one response."""
+        self.send(payload)
+        return self.recv(bufsize)
+
+    def note_reset(self, from_scanner: bool = True) -> None:
+        """Record that the exchange ended in a reset."""
+        self._frame(time.time(), from_scanner, TCP_RST)
+
+    def note_finished(self) -> None:
+        """Record that the exchange completed and we are closing cleanly."""
+        self._frame(time.time(), True, TCP_FIN_ACK)
+
+    def _frame(self, ts: float, from_scanner: bool, flags: int,
+               payload: bytes = b"") -> None:
+        if not self._writers:
+            return
+        if from_scanner:
+            src_ip, dst_ip = self._local_ip, self._ip
+            src_port, dst_port = self._src_port, self._cfg.port
+            seq, ack = self._scanner_seq, self._device_seq
+        else:
+            src_ip, dst_ip = self._ip, self._local_ip
+            src_port, dst_port = self._cfg.port, self._src_port
+            seq, ack = self._device_seq, self._scanner_seq
+        for writer in self._writers:
+            writer.write_packet(ts, src_ip, dst_ip, src_port, dst_port,
+                                flags, seq, ack, payload)
 
 
 def _rst_close(sock: socket.socket) -> None:
@@ -244,7 +362,9 @@ def scan_host(ip: str, cfg: ScanConfig, plugin: ProtocolPlugin,
         return [ScanResult(ip=ip, status=STATUS_TIMEOUT_CONNECT,
                            latency_ms=_ms(t_start), detail=f"connect error: {exc}")]
 
-    sock.settimeout(None)
+    # Not blocking indefinitely: a plugin that forgets to guard a recv would
+    # otherwise hold a worker thread for the rest of the scan.
+    sock.settimeout(cfg.response_timeout)
 
     if pcap_writers:
         local_ip, src_port = sock.getsockname()
@@ -305,7 +425,6 @@ def run_scan(targets: List[str], cfg: ScanConfig, plugin: ProtocolPlugin,
         return []
 
     combined_writer: Optional[PcapWriter] = None
-    host_writers: dict = {}
 
     if pcap_dir:
         try:
@@ -323,30 +442,34 @@ def run_scan(targets: List[str], cfg: ScanConfig, plugin: ProtocolPlugin,
         except OSError as exc:
             print(f"[warn] cannot create {combined_path}: {exc}", file=sys.stderr)
 
-        for ip in targets:
+    def _scan_one(ip: str) -> List[ScanResult]:
+        # The per-host capture file is opened here rather than up front, so a
+        # scan holds one file per busy thread instead of one per target -- a
+        # /16 with --pcap-dir used to exhaust the descriptor limit before the
+        # first result.
+        writers: List[PcapWriter] = []
+        host_writer: Optional[PcapWriter] = None
+        if pcap_dir:
             host_path = os.path.join(pcap_dir, f"{ip}.pcap")
             try:
-                host_writers[ip] = PcapWriter(host_path)
+                host_writer = PcapWriter(host_path)
+                writers.append(host_writer)
             except OSError as exc:
-                print(f"[warn] cannot create {host_path}: {exc}", file=sys.stderr)
+                with _print_lock:
+                    print(f"[warn] cannot create {host_path}: {exc}",
+                          file=sys.stderr)
+        if combined_writer:
+            writers.append(combined_writer)
+        try:
+            return scan_host(ip, cfg, plugin, writers if writers else None)
+        finally:
+            if host_writer:
+                host_writer.close()
 
     all_results: List[ScanResult] = []
 
     with ThreadPoolExecutor(max_workers=cfg.threads) as executor:
-        futures: dict = {}
-        future_host_writer: dict = {}
-
-        for ip in targets:
-            writers = []
-            hw = host_writers.get(ip)
-            if hw:
-                writers.append(hw)
-            if combined_writer:
-                writers.append(combined_writer)
-            fut = executor.submit(scan_host, ip, cfg, plugin,
-                                  writers if writers else None)
-            futures[fut] = ip
-            future_host_writer[fut] = hw
+        futures = {executor.submit(_scan_one, ip): ip for ip in targets}
 
         for future in as_completed(futures):
             ip = futures[future]
@@ -355,9 +478,6 @@ def run_scan(targets: List[str], cfg: ScanConfig, plugin: ProtocolPlugin,
             except Exception as exc:
                 host_results = [ScanResult(ip=ip, status=STATUS_NO_PROTOCOL,
                                            detail=str(exc))]
-            hw = future_host_writer.get(future)
-            if hw:
-                hw.close()
             for r in host_results:
                 all_results.append(r)
                 if print_result_fn:

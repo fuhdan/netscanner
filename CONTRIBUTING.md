@@ -7,8 +7,10 @@ Two ways to contribute: submit a plugin, or improve the framework itself.
 ## Contributing a plugin
 
 Plugins are developed in **[netscanner-plugins](https://github.com/fuhdan/netscanner-plugins)** —
-a separate repo where plugins are reviewed and tested. When a plugin is merged there,
-a pipeline automatically syncs it into this repo.
+a separate repo where plugins are reviewed and tested. That repo is the single source of
+truth for every plugin, bundled and community alike. When a plugin is merged there, a
+pipeline validates it once more and opens a pull request here, which lands by auto-merge
+once CI is green and a maintainer approves it.
 
 **Do not open plugin PRs here.** Go to netscanner-plugins instead.
 
@@ -32,7 +34,8 @@ output formatting, CLI. Protocol-agnostic. Changes here affect every plugin.
 for one protocol, it belongs in a plugin.
 
 > **Note:** `plugins/` is managed automatically by the netscanner-plugins sync pipeline.
-> Do not edit files in `plugins/` directly in this repo.
+> Do not edit files in `plugins/` directly in this repo — the sync mirrors that repo, so a
+> hand edit here is overwritten, and a plugin removed there is removed here.
 
 ---
 
@@ -40,4 +43,11 @@ for one protocol, it belongs in a plugin.
 
 Every PR runs `pytest tests/` on Python 3.9, 3.11, and 3.12.
 PRs cannot be merged until all checks pass and at least one maintainer has approved.
-Main is protected — no direct pushes.
+Main is protected — no direct pushes. Plugin syncs arrive as pull requests and go
+through the same gate.
+
+---
+
+## Licence
+
+Apache-2.0 — see [LICENSE](LICENSE). Contributions are accepted under that licence.

@@ -46,9 +46,13 @@ class ProtocolPlugin:
 ## Framework guarantees before probe() is called
 
 - TCP connect succeeded within `cfg.connect_timeout`
-- A14 check passed (no premature server FIN/RST)
+- The connection survived a 50 ms read window: a server that sent a FIN, reset,
+  or spoke before being asked was already reported and never reaches `probe()`
 - If `pcap_writers` is not None: SYN, SYN-ACK, ACK frames already written
-- Socket is in blocking mode (`settimeout(None)`)
+- The socket carries a timeout of `cfg.response_timeout`, so a `recv` or
+  `sendall` you forget to guard raises rather than holding a worker thread for
+  the rest of the scan. Guard them anyway — `select` lets you tell a stalled
+  receive window apart from a silent peer, and those are different findings
 - pcap seq starts at 1/1 post-handshake
 
 ---
@@ -78,38 +82,51 @@ ScanResult(ip=ip, status=STATUS_OPEN, latency_ms=42.0,
 
 ---
 
-## Writing pcap frames from probe()
+## ProbeChannel — the socket work you should not write yourself
 
-Import the TCP flag constants from netscanner:
-
-```python
-from netscanner import TCP_PSH_ACK, TCP_RST, TCP_FIN_ACK
-```
-
-Track scanner and device sequence numbers starting at 1
-(the framework wrote SYN/SYN-ACK/ACK before calling probe()):
+Three things are the same in every plugin: telling a stalled receive window
+apart from a silent peer, writing the capture frames, and keeping the two
+sequence numbers straight. `ProbeChannel` does all three.
 
 ```python
-_scanner_seq = [1]
-_device_seq  = [1]
+from netscanner import ProbeChannel, ZeroWindowError
 
-def _pcap_log(direction, ts, raw_bytes):
-    if direction == 'send':
-        for w in pcap_writers:
-            w.write_packet(ts, local_ip, ip, src_port, cfg.port,
-                           TCP_PSH_ACK, _scanner_seq[0], _device_seq[0], raw_bytes)
-        _scanner_seq[0] += len(raw_bytes)
-    else:
-        for w in pcap_writers:
-            w.write_packet(ts, ip, local_ip, cfg.port, src_port,
-                           TCP_PSH_ACK, _device_seq[0], _scanner_seq[0], raw_bytes)
-        _device_seq[0] += len(raw_bytes)
+def probe(self, sock, ip, cfg, pcap_writers):
+    channel = ProbeChannel(sock, ip, cfg, pcap_writers)
+    try:
+        reply = channel.exchange(build_request())
+    except ZeroWindowError:
+        channel.note_reset()
+        return [ScanResult(ip=ip, status=STATUS_ZERO_WINDOW,
+                           detail="TCP ZeroWindow on send")]
+    except TimeoutError:
+        channel.note_reset()
+        return [ScanResult(ip=ip, status=STATUS_TIMEOUT_RESPONSE,
+                           detail="no response within timeout")]
+    except OSError as exc:
+        channel.note_reset(from_scanner=False)
+        return [ScanResult(ip=ip, status="NO_MYPROTOCOL", detail=str(exc))]
+
+    channel.note_finished()
+    return [ScanResult(ip=ip, status=STATUS_OPEN, extra=parse(reply))]
 ```
 
-Log RST on ZeroWindow/Timeout/OSError. Log FIN-ACK when all results are OPEN
-(before returning — the framework's clean_close follows).
+| | |
+|---|---|
+| `send(payload)` | sends under `cfg.response_timeout`; raises `ZeroWindowError` if the peer will not take it |
+| `recv(bufsize=4096)` | reads one response; raises `TimeoutError` on silence, `OSError` if the peer closed |
+| `exchange(payload, bufsize=4096)` | one request, one response |
+| `note_reset(from_scanner=True)` | record that the exchange ended in a reset — pass `False` when the device reset us |
+| `note_finished()` | record a clean finish; call it before returning all-`OPEN` results |
 
----
+Every method is a no-op on the capture side when `pcap_writers` is `None`, so
+the same code works with and without `--pcap-dir`. Sequence numbers start at 1
+on both sides and advance by payload length, which is what makes Wireshark read
+the file as one conversation.
+
+The socket is still yours: a protocol that needs something the channel does not
+offer can use it directly, and write frames itself with
+`PcapWriter.write_packet` and the `TCP_*` flag constants from `netscanner`.
 
 ## Status constants
 
@@ -131,6 +148,12 @@ Unknown statuses render in neutral grey in the terminal.
 
 Exactly one `ProtocolPlugin` subclass per `.py` file in `plugins/`.
 `__init__.py` is skipped. Files are imported in alphabetical order.
+
+Discovery is defensive: a file that raises on import, a class that raises when
+constructed, and a class with no `name` are each reported on stderr and skipped,
+so one bad plugin costs that plugin and not the scan. A `name` already taken by
+an earlier plugin is refused rather than silently overwriting it — pick a name
+no other plugin uses.
 
 ---
 

@@ -10,13 +10,12 @@ from unittest.mock import MagicMock, patch
 
 from netscanner import (
     ScanResult, ScanConfig, ProtocolPlugin,
-    PcapWriter, TCP_SYN, TCP_ACK, TCP_SYN_ACK,
-    TCP_PSH_ACK, TCP_FIN_ACK, TCP_RST, _ip_checksum,
+    PcapWriter, TCP_ACK, TCP_PSH_ACK, TCP_RST, TCP_FIN_ACK, _ip_checksum,
     expand_targets,
     STATUS_OPEN, STATUS_REFUSED, STATUS_TIMEOUT_CONNECT,
-    STATUS_TIMEOUT_RESPONSE, STATUS_ZERO_WINDOW,
     STATUS_CLOSED_IMMEDIATELY, STATUS_NO_PROTOCOL,
     scan_host, run_scan, format_result_line, format_summary, write_csv,
+    _discover_plugins, ProbeChannel, ZeroWindowError,
 )
 
 
@@ -427,3 +426,349 @@ def test_write_csv_missing_extra_empty():
     assert "unit_id" in lines[0]
     row2 = lines[2].split(",")
     assert row2[0] == "10.0.0.2"
+
+
+# ---------------------------------------------------------------------------
+# plugin discovery is defensive
+# ---------------------------------------------------------------------------
+
+class _GoodPlugin(ProtocolPlugin):
+    name = "good"
+    default_port = 1234
+
+    def probe(self, sock, ip, cfg, pcap_writers):
+        return [ScanResult(ip=ip, status=STATUS_OPEN)]
+
+
+class _OtherPlugin(ProtocolPlugin):
+    name = "good"          # deliberately the same name as _GoodPlugin
+    default_port = 4321
+
+    def probe(self, sock, ip, cfg, pcap_writers):
+        return [ScanResult(ip=ip, status=STATUS_OPEN)]
+
+
+class _UnnamedPlugin(ProtocolPlugin):
+    default_port = 1111
+
+    def probe(self, sock, ip, cfg, pcap_writers):
+        return [ScanResult(ip=ip, status=STATUS_OPEN)]
+
+
+def _module_with(name, *plugin_classes):
+    import types
+    mod = types.ModuleType(name)
+    for cls in plugin_classes:
+        setattr(mod, cls.__name__, cls)
+    return mod
+
+
+def _fake_importer(mapping):
+    """import_module stand-in: name -> module, or an exception to raise."""
+    import sys as _sys
+
+    def _imp(name):
+        if name == "netscanner":
+            return _sys.modules["netscanner"]
+        outcome = mapping[name]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+    return _imp
+
+
+@patch("netscanner.importlib.import_module")
+@patch("netscanner.glob.glob")
+def test_discover_skips_plugin_that_fails_to_import(mock_glob, mock_import, capsys):
+    mock_glob.return_value = ["/p/plugins/broken.py", "/p/plugins/good.py"]
+    mock_import.side_effect = _fake_importer({
+        "plugins.broken": RuntimeError("boom"),
+        "plugins.good": _module_with("plugins.good", _GoodPlugin),
+    })
+    plugins = _discover_plugins()
+    assert "good" in plugins
+    err = capsys.readouterr().err
+    assert "broken" in err and "boom" in err
+
+
+@patch("netscanner.importlib.import_module")
+@patch("netscanner.glob.glob")
+def test_discover_survives_plugin_that_raises_on_instantiation(
+        mock_glob, mock_import, capsys):
+    class _ExplodingPlugin(ProtocolPlugin):
+        name = "explode"
+        default_port = 1
+
+        def __init__(self):
+            raise ValueError("nope")
+
+        def probe(self, sock, ip, cfg, pcap_writers):
+            return []
+
+    mock_glob.return_value = ["/p/plugins/bad.py", "/p/plugins/good.py"]
+    mock_import.side_effect = _fake_importer({
+        "plugins.bad": _module_with("plugins.bad", _ExplodingPlugin),
+        "plugins.good": _module_with("plugins.good", _GoodPlugin),
+    })
+    plugins = _discover_plugins()
+    assert list(plugins) == ["good"]
+    assert "nope" in capsys.readouterr().err
+
+
+@patch("netscanner.importlib.import_module")
+@patch("netscanner.glob.glob")
+def test_discover_keeps_first_of_two_plugins_with_the_same_name(
+        mock_glob, mock_import, capsys):
+    mock_glob.return_value = ["/p/plugins/a.py", "/p/plugins/b.py"]
+    mock_import.side_effect = _fake_importer({
+        "plugins.a": _module_with("plugins.a", _GoodPlugin),
+        "plugins.b": _module_with("plugins.b", _OtherPlugin),
+    })
+    plugins = _discover_plugins()
+    assert plugins["good"].default_port == 1234
+    assert "duplicate" in capsys.readouterr().err.lower()
+
+
+@patch("netscanner.importlib.import_module")
+@patch("netscanner.glob.glob")
+def test_discover_skips_plugin_without_a_name(mock_glob, mock_import, capsys):
+    mock_glob.return_value = ["/p/plugins/nameless.py"]
+    mock_import.side_effect = _fake_importer({
+        "plugins.nameless": _module_with("plugins.nameless", _UnnamedPlugin),
+    })
+    assert _discover_plugins() == {}
+    assert "name" in capsys.readouterr().err.lower()
+
+
+# ---------------------------------------------------------------------------
+# IPv6 targets are refused up front rather than failing at connect
+# ---------------------------------------------------------------------------
+
+def test_ipv6_address_is_rejected(capsys):
+    assert expand_targets(["2001:db8::1"], None) == []
+    assert "IPv6" in capsys.readouterr().err
+
+
+def test_ipv6_network_is_rejected(capsys):
+    assert expand_targets(["2001:db8::/125"], None) == []
+    assert "IPv6" in capsys.readouterr().err
+
+
+def test_ipv6_rejection_does_not_drop_ipv4_targets(capsys):
+    assert expand_targets(["10.0.0.1", "2001:db8::1", "10.0.0.2"], None) == \
+        ["10.0.0.1", "10.0.0.2"]
+    assert "IPv6" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# the framework bounds how long a plugin can sit on the socket
+# ---------------------------------------------------------------------------
+
+@patch("netscanner.select.select")
+@patch("netscanner.socket.socket")
+def test_socket_carries_response_timeout_into_probe(mock_socket_cls, mock_select):
+    sock = MagicMock()
+    mock_socket_cls.return_value = sock
+    mock_select.return_value = ([], [], [])
+    # _clean_close drains the socket; return b"" so the loop exits
+    sock.recv.return_value = b""
+    seen = {}
+
+    class _RecordingPlugin(ProtocolPlugin):
+        name = "recording"
+        default_port = 9999
+
+        def probe(self, s, ip, cfg, pcap_writers):
+            seen["timeout"] = [c.args[0] for c in s.settimeout.call_args_list]
+            return [ScanResult(ip=ip, status=STATUS_OPEN)]
+
+    scan_host("10.0.0.1", ScanConfig(port=9999, response_timeout=7.5),
+              _RecordingPlugin())
+    assert seen["timeout"][-1] == 7.5
+
+
+# ---------------------------------------------------------------------------
+# per-host capture files are opened while a host is scanned, not all at once
+# ---------------------------------------------------------------------------
+
+def test_pcap_writers_are_not_all_open_at_once():
+    open_now = set()
+    high_water = []
+
+    real_init = PcapWriter.__init__
+    real_close = PcapWriter.close
+
+    def counting_init(self, path):
+        real_init(self, path)
+        open_now.add(id(self))
+        high_water.append(len(open_now))
+
+    def counting_close(self):
+        open_now.discard(id(self))
+        real_close(self)
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        with patch.object(PcapWriter, "__init__", counting_init), \
+                patch.object(PcapWriter, "close", counting_close), \
+                patch("netscanner.scan_host") as mock_scan:
+            mock_scan.side_effect = lambda ip, cfg, plugin, writers=None: [
+                ScanResult(ip=ip, status=STATUS_OPEN)]
+            targets = [f"10.0.0.{i}" for i in range(1, 9)]
+            run_scan(targets, ScanConfig(threads=2), FakePlugin(),
+                     pcap_dir=tmpdir)
+        # one combined writer plus at most one host writer per worker thread,
+        # never one per target
+        assert max(high_water) <= 1 + 2
+        assert len(high_water) == len(targets) + 1
+        assert len(os.listdir(tmpdir)) == len(targets) + 1
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# ProbeChannel — the send/receive pair and the capture frames every plugin
+# used to re-implement
+# ---------------------------------------------------------------------------
+
+class _CollectingWriter:
+    """Stands in for a PcapWriter and keeps what it was asked to write."""
+
+    def __init__(self):
+        self.frames = []
+
+    def write_packet(self, ts, src_ip, dst_ip, src_port, dst_port, flags,
+                     seq, ack, payload=b""):
+        self.frames.append({
+            "src_ip": src_ip, "dst_ip": dst_ip, "src_port": src_port,
+            "dst_port": dst_port, "flags": flags, "seq": seq, "ack": ack,
+            "payload": payload,
+        })
+
+
+def _channel(writers=None, response_timeout=3.0):
+    sock = MagicMock()
+    sock.getsockname.return_value = ("10.0.0.250", 51000)
+    cfg = ScanConfig(port=502, response_timeout=response_timeout)
+    return sock, ProbeChannel(sock, "10.0.0.1", cfg, writers)
+
+
+@patch("netscanner.select.select")
+def test_channel_send_raises_zero_window_when_not_writable(mock_select):
+    mock_select.return_value = ([], [], [])
+    sock, ch = _channel()
+    with pytest.raises(ZeroWindowError):
+        ch.send(b"hello")
+    sock.sendall.assert_not_called()
+
+
+@patch("netscanner.select.select")
+def test_channel_send_writes_a_frame_and_advances_the_scanner_seq(mock_select):
+    w = _CollectingWriter()
+    sock, ch = _channel([w])
+    mock_select.return_value = ([], [sock], [])
+    ch.send(b"abcd")
+    ch.send(b"ef")
+    assert [f["seq"] for f in w.frames] == [1, 5]
+    assert all(f["ack"] == 1 for f in w.frames)
+    assert w.frames[0]["src_ip"] == "10.0.0.250"
+    assert w.frames[0]["dst_ip"] == "10.0.0.1"
+    assert w.frames[0]["flags"] == TCP_PSH_ACK
+    assert w.frames[0]["payload"] == b"abcd"
+
+
+@patch("netscanner.select.select")
+def test_channel_recv_raises_timeout_when_nothing_arrives(mock_select):
+    mock_select.return_value = ([], [], [])
+    sock, ch = _channel()
+    with pytest.raises(TimeoutError):
+        ch.recv()
+
+
+@patch("netscanner.select.select")
+def test_channel_recv_raises_oserror_when_the_peer_closes(mock_select):
+    sock, ch = _channel()
+    mock_select.return_value = ([sock], [], [])
+    sock.recv.return_value = b""
+    with pytest.raises(OSError):
+        ch.recv()
+
+
+@patch("netscanner.select.select")
+def test_channel_recv_writes_the_reverse_frame_and_advances_the_device_seq(
+        mock_select):
+    w = _CollectingWriter()
+    sock, ch = _channel([w])
+    mock_select.return_value = ([sock], [], [])
+    sock.recv.return_value = b"xyz"
+    assert ch.recv() == b"xyz"
+    f = w.frames[0]
+    assert f["src_ip"] == "10.0.0.1" and f["dst_ip"] == "10.0.0.250"
+    assert f["src_port"] == 502 and f["dst_port"] == 51000
+    assert (f["seq"], f["ack"]) == (1, 1)
+    sock.recv.return_value = b"z"
+    ch.recv()
+    assert w.frames[1]["seq"] == 4
+
+
+@patch("netscanner.select.select")
+def test_channel_exchange_sends_then_receives(mock_select):
+    w = _CollectingWriter()
+    sock, ch = _channel([w])
+    mock_select.side_effect = lambda r, wr, x, t: (([sock], [], [])
+                                                   if r else ([], [sock], []))
+    sock.recv.return_value = b"pong"
+    assert ch.exchange(b"ping") == b"pong"
+    assert [f["payload"] for f in w.frames] == [b"ping", b"pong"]
+    # the reply is acknowledged against the bytes we sent
+    assert w.frames[1]["ack"] == 1 + len(b"ping")
+
+
+@patch("netscanner.select.select")
+def test_channel_notes_reset_from_either_side(mock_select):
+    w = _CollectingWriter()
+    sock, ch = _channel([w])
+    mock_select.return_value = ([], [sock], [])
+    ch.send(b"ab")
+    ch.note_reset()
+    ch.note_reset(from_scanner=False)
+    assert w.frames[1]["flags"] == TCP_RST
+    assert w.frames[1]["src_ip"] == "10.0.0.250"
+    assert w.frames[2]["flags"] == TCP_RST
+    assert w.frames[2]["src_ip"] == "10.0.0.1"
+
+
+@patch("netscanner.select.select")
+def test_channel_notes_a_clean_finish(mock_select):
+    w = _CollectingWriter()
+    sock, ch = _channel([w])
+    mock_select.return_value = ([], [sock], [])
+    ch.send(b"ab")
+    ch.note_finished()
+    assert w.frames[-1]["flags"] == TCP_FIN_ACK
+    assert w.frames[-1]["seq"] == 3
+
+
+@patch("netscanner.select.select")
+def test_channel_without_writers_records_nothing_and_reads_no_socket_name(
+        mock_select):
+    sock = MagicMock()
+    cfg = ScanConfig(port=502)
+    ch = ProbeChannel(sock, "10.0.0.1", cfg, None)
+    mock_select.side_effect = lambda r, wr, x, t: (([sock], [], [])
+                                                   if r else ([], [sock], []))
+    sock.recv.return_value = b"ok"
+    assert ch.exchange(b"go") == b"ok"
+    ch.note_reset()
+    ch.note_finished()
+    sock.getsockname.assert_not_called()
+
+
+@patch("netscanner.select.select")
+def test_channel_writes_to_every_writer(mock_select):
+    a, b = _CollectingWriter(), _CollectingWriter()
+    sock, ch = _channel([a, b])
+    mock_select.return_value = ([], [sock], [])
+    ch.send(b"x")
+    assert len(a.frames) == 1 and len(b.frames) == 1

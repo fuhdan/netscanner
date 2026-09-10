@@ -29,7 +29,8 @@ jobs:
             echo "Tag push — running release unconditionally."
             exit 0
           fi
-          CHANGED=$(git diff --name-only HEAD~1 -- plugins/ tests/ 2>/dev/null \
+          CHANGED=$(git diff --name-only HEAD~1 \
+              -- plugins/ 'tests/test_plugin_*.py' 2>/dev/null \
             | grep -vE '(^|/)__init__\.py$' || true)
           if [ -z "$CHANGED" ]; then
             echo "skip=true" >> $GITHUB_OUTPUT
@@ -116,8 +117,10 @@ jobs:
       - name: Package assets
         if: steps.guard.outputs.skip != 'true'
         run: |
-          zip -r netscanner-${{ steps.version.outputs.tag }}.zip \
-            netscanner.py plugins/ docs/ README.md
+          ZIP=netscanner-${{ steps.version.outputs.tag }}.zip
+          zip -r "$ZIP" \
+            netscanner.py plugins/ docs/ README.md LICENSE NOTICE
+          sha256sum "$ZIP" > "$ZIP.sha256"
 
       - name: Create GitHub release
         if: steps.guard.outputs.skip != 'true'
@@ -126,5 +129,6 @@ jobs:
         run: |
           gh release create ${{ steps.version.outputs.tag }} \
             netscanner-${{ steps.version.outputs.tag }}.zip \
+            netscanner-${{ steps.version.outputs.tag }}.zip.sha256 \
             --notes-file /tmp/release_notes.md \
             --title "${{ steps.version.outputs.tag }}"

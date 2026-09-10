@@ -46,9 +46,13 @@ class ProtocolPlugin:
 ## Framework guarantees before probe() is called
 
 - TCP connect succeeded within `cfg.connect_timeout`
-- A14 check passed (no premature server FIN/RST)
+- The connection survived a 50 ms read window: a server that sent a FIN, reset,
+  or spoke before being asked was already reported and never reaches `probe()`
 - If `pcap_writers` is not None: SYN, SYN-ACK, ACK frames already written
-- Socket is in blocking mode (`settimeout(None)`)
+- The socket carries a timeout of `cfg.response_timeout`, so a `recv` or
+  `sendall` you forget to guard raises rather than holding a worker thread for
+  the rest of the scan. Guard them anyway — `select` lets you tell a stalled
+  receive window apart from a silent peer, and those are different findings
 - pcap seq starts at 1/1 post-handshake
 
 ---
@@ -131,6 +135,12 @@ Unknown statuses render in neutral grey in the terminal.
 
 Exactly one `ProtocolPlugin` subclass per `.py` file in `plugins/`.
 `__init__.py` is skipped. Files are imported in alphabetical order.
+
+Discovery is defensive: a file that raises on import, a class that raises when
+constructed, and a class with no `name` are each reported on stderr and skipped,
+so one bad plugin costs that plugin and not the scan. A `name` already taken by
+an earlier plugin is refused rather than silently overwriting it — pick a name
+no other plugin uses.
 
 ---
 

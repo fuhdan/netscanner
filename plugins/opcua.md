@@ -22,6 +22,15 @@ Only one Hello is sent per host. Unlike Modbus, OPC-UA offers no second
 attempt on the same connection: after a Hello the server expects an
 `OpenSecureChannel`, and it closes the connection once it has sent an Error.
 
+## Installation
+
+None. Merged plugins are synced into netscanner, so a current netscanner
+checkout already has this plugin. Verify with:
+
+```bash
+python3 netscanner.py --list-protocols
+```
+
 ## Usage
 
 ```bash
@@ -72,6 +81,12 @@ expects. Treat it as a confirmed find.
 [10.0.0.4]    REFUSED    connection refused    1ms
 ```
 
+## Requirements
+
+- Python 3.9+
+- netscanner (any version)
+- No other dependencies — standard library only
+
 ## Known limitations
 
 - Stops at the Hello/Acknowledge handshake. It does not open a SecureChannel,
@@ -88,3 +103,7 @@ expects. Treat it as a confirmed find.
 - Buffer sizes are a weak vendor fingerprint at best. They differ between SDKs
   but are operator-configurable and are clamped by what the client offered.
 - Does not scan OPC-UA over HTTPS or WebSockets, only the binary TCP mapping.
+
+## Licence
+
+Apache-2.0, as part of netscanner-plugins.

@@ -74,12 +74,35 @@ def _discover_plugins() -> dict:
         if os.path.basename(path) == "__init__.py":
             continue
         stem = os.path.splitext(os.path.basename(path))[0]
-        mod = importlib.import_module(f"plugins.{stem}")
+        # Anyone may drop a file in here, so one bad plugin must cost that
+        # plugin and nothing else -- not the whole scanner, and not
+        # --list-protocols.
+        try:
+            mod = importlib.import_module(f"plugins.{stem}")
+        except Exception as exc:
+            print(f"[warn] plugin '{stem}' failed to import, skipping: "
+                  f"{exc.__class__.__name__}: {exc}", file=sys.stderr)
+            continue
         for obj in vars(mod).values():
             if (isinstance(obj, type) and
                     any(issubclass(obj, base) for base in _base_classes) and
                     obj not in _base_classes):
-                instance = obj()
+                try:
+                    instance = obj()
+                except Exception as exc:
+                    print(f"[warn] plugin class {obj.__name__} in '{stem}' "
+                          f"could not be created, skipping: "
+                          f"{exc.__class__.__name__}: {exc}", file=sys.stderr)
+                    continue
+                if not instance.name:
+                    print(f"[warn] plugin class {obj.__name__} in '{stem}' "
+                          f"declares no name, skipping", file=sys.stderr)
+                    continue
+                if instance.name in result:
+                    print(f"[warn] duplicate plugin name '{instance.name}' in "
+                          f"'{stem}', keeping the one already loaded",
+                          file=sys.stderr)
+                    continue
                 result[instance.name] = instance
     return result
 
@@ -100,19 +123,27 @@ def expand_targets(args: List[str], file_path: Optional[str]) -> List[str]:
     for entry in raw:
         try:
             net = ipaddress.ip_network(entry, strict=False)
-            if net.num_addresses == 1:
-                ip = str(net.network_address)
+        except ValueError:
+            print(f"[warn] invalid target '{entry}', skipping", file=sys.stderr)
+            continue
+        # The socket and the packet builder are both IPv4-only, so an IPv6
+        # target would be scanned and reported as a connect error. Say so here
+        # instead.
+        if net.version != 4:
+            print(f"[warn] IPv6 target '{entry}' skipped — netscanner is "
+                  f"IPv4-only", file=sys.stderr)
+            continue
+        if net.num_addresses == 1:
+            ip = str(net.network_address)
+            if ip not in seen:
+                seen.add(ip)
+                result.append(ip)
+        else:
+            for host in net.hosts():
+                ip = str(host)
                 if ip not in seen:
                     seen.add(ip)
                     result.append(ip)
-            else:
-                for host in net.hosts():
-                    ip = str(host)
-                    if ip not in seen:
-                        seen.add(ip)
-                        result.append(ip)
-        except ValueError:
-            print(f"[warn] invalid target '{entry}', skipping", file=sys.stderr)
     return result
 
 
@@ -244,7 +275,9 @@ def scan_host(ip: str, cfg: ScanConfig, plugin: ProtocolPlugin,
         return [ScanResult(ip=ip, status=STATUS_TIMEOUT_CONNECT,
                            latency_ms=_ms(t_start), detail=f"connect error: {exc}")]
 
-    sock.settimeout(None)
+    # Not blocking indefinitely: a plugin that forgets to guard a recv would
+    # otherwise hold a worker thread for the rest of the scan.
+    sock.settimeout(cfg.response_timeout)
 
     if pcap_writers:
         local_ip, src_port = sock.getsockname()
@@ -305,7 +338,6 @@ def run_scan(targets: List[str], cfg: ScanConfig, plugin: ProtocolPlugin,
         return []
 
     combined_writer: Optional[PcapWriter] = None
-    host_writers: dict = {}
 
     if pcap_dir:
         try:
@@ -323,30 +355,34 @@ def run_scan(targets: List[str], cfg: ScanConfig, plugin: ProtocolPlugin,
         except OSError as exc:
             print(f"[warn] cannot create {combined_path}: {exc}", file=sys.stderr)
 
-        for ip in targets:
+    def _scan_one(ip: str) -> List[ScanResult]:
+        # The per-host capture file is opened here rather than up front, so a
+        # scan holds one file per busy thread instead of one per target -- a
+        # /16 with --pcap-dir used to exhaust the descriptor limit before the
+        # first result.
+        writers: List[PcapWriter] = []
+        host_writer: Optional[PcapWriter] = None
+        if pcap_dir:
             host_path = os.path.join(pcap_dir, f"{ip}.pcap")
             try:
-                host_writers[ip] = PcapWriter(host_path)
+                host_writer = PcapWriter(host_path)
+                writers.append(host_writer)
             except OSError as exc:
-                print(f"[warn] cannot create {host_path}: {exc}", file=sys.stderr)
+                with _print_lock:
+                    print(f"[warn] cannot create {host_path}: {exc}",
+                          file=sys.stderr)
+        if combined_writer:
+            writers.append(combined_writer)
+        try:
+            return scan_host(ip, cfg, plugin, writers if writers else None)
+        finally:
+            if host_writer:
+                host_writer.close()
 
     all_results: List[ScanResult] = []
 
     with ThreadPoolExecutor(max_workers=cfg.threads) as executor:
-        futures: dict = {}
-        future_host_writer: dict = {}
-
-        for ip in targets:
-            writers = []
-            hw = host_writers.get(ip)
-            if hw:
-                writers.append(hw)
-            if combined_writer:
-                writers.append(combined_writer)
-            fut = executor.submit(scan_host, ip, cfg, plugin,
-                                  writers if writers else None)
-            futures[fut] = ip
-            future_host_writer[fut] = hw
+        futures = {executor.submit(_scan_one, ip): ip for ip in targets}
 
         for future in as_completed(futures):
             ip = futures[future]
@@ -355,9 +391,6 @@ def run_scan(targets: List[str], cfg: ScanConfig, plugin: ProtocolPlugin,
             except Exception as exc:
                 host_results = [ScanResult(ip=ip, status=STATUS_NO_PROTOCOL,
                                            detail=str(exc))]
-            hw = future_host_writer.get(future)
-            if hw:
-                hw.close()
             for r in host_results:
                 all_results.append(r)
                 if print_result_fn:
